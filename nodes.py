@@ -24,6 +24,16 @@ from langgraph.types import interrupt
 
 from state import RebookingState
 from tools import get_booking, search_flights, get_fare_rules
+from prompts import (
+    CLASSIFIER_PROMPT,
+    CLARIFY_CONSTRAINTS_MSG,
+    REBOOKING_AGENT_PROMPT,
+    REFUND_AGENT_PROMPT,
+    COMPENSATION_AGENT_PROMPT,
+    ESCALATION_AGENT_PROMPT,
+    FINAL_RESPONSE_ESCALATED_PROMPT,
+    FINAL_RESPONSE_RESOLVED_PROMPT,
+)
 
 # ── LLM configuration ─────────────────────────────────────────────────────────
 # Groq API is OpenAI-compatible; set GROQ_API_KEY in your .env file.
@@ -90,15 +100,7 @@ def request_classifier(state: RebookingState) -> dict:
         (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
         ""
     )
-    sys_msg = SystemMessage(content=(
-        "You are an airline disruption intake classifier. "
-        "Read the passenger message and extract their intent and any constraints.\n"
-        "Intent must be exactly one of: rebook, refund, compensation, complaint.\n"
-        "- rebook: passenger wants a new flight\n"
-        "- refund: passenger wants money back\n"
-        "- compensation: passenger asks about entitlements for delay/cancellation\n"
-        "- complaint: passenger is angry and wants human intervention"
-    ))
+    sys_msg = SystemMessage(content=CLASSIFIER_PROMPT)
 
     structured_llm = llm.with_structured_output(ClassifierOutput)
     result: ClassifierOutput = structured_llm.invoke([sys_msg, HumanMessage(content=last_human)])
@@ -127,11 +129,7 @@ def clarify_constraints(state: RebookingState) -> dict:
 
     if constraints in _VAGUE_CONSTRAINTS:
         # Pause the graph and ask the passenger
-        answer = interrupt(
-            "❓ Clarification needed: Could you tell us more about your travel requirements?\n"
-            "For example: preferred arrival date/time, cabin class, or any other preferences.\n"
-            "(Type your answer and press Enter)"
-        )
+        answer = interrupt(CLARIFY_CONSTRAINTS_MSG)
         # `answer` is whatever the human typed when resuming the graph
         return {"constraints": str(answer).strip()}
 
@@ -155,14 +153,13 @@ def rebooking_agent(state: RebookingState) -> dict:
             "Stop trying — there are no valid flights."
         )
 
-    sys_msg = SystemMessage(content=(
-        f"You are a Rebooking Agent. Booking ref: {state.get('booking_ref')}. "
-        f"Passenger constraints: {state.get('constraints', 'none')}.\n"
-        "1. Call get_booking to get the passenger's booking details.\n"
-        "2. Call search_flights(origin, destination, date='tomorrow') to find available flights.\n"
-        "3. Once you have called both tools, do NOT call any more tools. Stop."
-        f"{failure_note}"
-    ))
+    sys_msg = SystemMessage(
+        content=REBOOKING_AGENT_PROMPT.format(
+            booking_ref=state.get("booking_ref", "N/A"),
+            constraints=state.get("constraints", "none"),
+            failure_note=failure_note
+        )
+    )
 
     agent_llm = llm.bind_tools([get_booking, search_flights])
     all_messages = [sys_msg] + state["messages"]
@@ -208,12 +205,11 @@ def refund_agent(state: RebookingState) -> dict:
     Tool-calling agent. Gets booking + fare rules, then proposes refund from data.
     Writes: messages, active_agent, proposed_solution, booking_details.
     """
-    sys_msg = SystemMessage(content=(
-        f"You are a Refund Agent. Booking ref: {state.get('booking_ref')}.\n"
-        "1. Call get_booking to get the passenger's booking details.\n"
-        "2. Call get_fare_rules(fare_type) using the fare_type from the booking.\n"
-        "3. Once you have called both tools, do NOT call any more tools. Stop."
-    ))
+    sys_msg = SystemMessage(
+        content=REFUND_AGENT_PROMPT.format(
+            booking_ref=state.get("booking_ref", "N/A")
+        )
+    )
 
     agent_llm = llm.bind_tools([get_booking, get_fare_rules])
     response: AIMessage = agent_llm.invoke([sys_msg] + state["messages"])
@@ -266,11 +262,11 @@ def compensation_agent(state: RebookingState) -> dict:
     Tool-calling agent. Gets booking disruption details, proposes compensation by policy.
     Writes: messages, active_agent, proposed_solution, booking_details.
     """
-    sys_msg = SystemMessage(content=(
-        f"You are a Compensation Agent. Booking ref: {state.get('booking_ref')}.\n"
-        "1. Call get_booking to get the passenger's booking and disruption details.\n"
-        "2. Once you have the result, do NOT call any more tools. Stop."
-    ))
+    sys_msg = SystemMessage(
+        content=COMPENSATION_AGENT_PROMPT.format(
+            booking_ref=state.get("booking_ref", "N/A")
+        )
+    )
 
     agent_llm = llm.bind_tools([get_booking])
     response: AIMessage = agent_llm.invoke([sys_msg] + state["messages"])
@@ -386,10 +382,13 @@ def policy_checker(state: RebookingState) -> dict:
         if is_valid:
             try:
                 if float(sol.get("amount_usd", 0)) > 300:
-                    interrupt(
+                    answer = interrupt(
                         f"⚠️ Human approval required: refund of ${sol['amount_usd']:.2f} exceeds $300. "
                         "Approve or reject."
                     )
+                    if answer and "reject" in str(answer).lower():
+                        is_valid = False
+                        reason = f"Human supervisor rejected the refund. Note: {answer}"
             except (ValueError, TypeError):
                 pass
 
@@ -421,10 +420,13 @@ def policy_checker(state: RebookingState) -> dict:
 
         # Bonus: Human-in-the-loop for compensation > $300
         if is_valid and proposed_amt > 300:
-            interrupt(
+            answer = interrupt(
                 f"⚠️ Human approval required: compensation of ${proposed_amt:.2f} exceeds $300. "
                 "Approve or reject."
             )
+            if answer and "reject" in str(answer).lower():
+                is_valid = False
+                reason = f"Human supervisor rejected the compensation. Note: {answer}"
 
     retry_count = state.get("retry_count", 0)
     if not is_valid:
@@ -457,15 +459,15 @@ def escalation_agent(state: RebookingState) -> dict:
         "N/A"
     )
 
-    sys_msg = SystemMessage(content=(
-        f"Write a brief, professional handover note for a human airline agent.\n\n"
-        f"Passenger: {passenger}\n"
-        f"Booking ref: {booking_ref}\n"
-        f"Original request: {original_msg}\n"
-        f"Attempts made: {tries}\n"
-        f"Reason could not be resolved automatically: {failure}\n\n"
-        "End the note with: 'Action required: human review needed.'"
-    ))
+    sys_msg = SystemMessage(
+        content=ESCALATION_AGENT_PROMPT.format(
+            passenger=passenger,
+            booking_ref=booking_ref,
+            original_msg=original_msg,
+            tries=tries,
+            failure=failure
+        )
+    )
 
     response = llm.invoke([sys_msg])
     note = response.content
@@ -488,14 +490,11 @@ def final_response_agent(state: RebookingState) -> dict:
     passenger = booking.get("passenger", "there")
 
     if state.get("escalation_status"):
-        sys_msg = SystemMessage(content=(
-            f"Write a polite, empathetic message to an airline passenger named {passenger}.\n"
-            "Their case has been escalated to a human agent.\n"
-            "Tell them:\n"
-            "1. You apologise for the disruption.\n"
-            "2. Their case has been escalated and a dedicated agent will contact them within 24 hours.\n"
-            "3. Keep it brief (3–4 sentences)."
-        ))
+        sys_msg = SystemMessage(
+            content=FINAL_RESPONSE_ESCALATED_PROMPT.format(
+                passenger=passenger
+            )
+        )
     else:
         sol = state.get("proposed_solution", {})
         sol_type = sol.get("type", "")
@@ -522,14 +521,13 @@ def final_response_agent(state: RebookingState) -> dict:
             solution_text = "your request has been processed."
             next_steps = "Please contact us if you need further assistance."
 
-        sys_msg = SystemMessage(content=(
-            f"Write a friendly, clear reply to passenger {passenger}. Include:\n"
-            f"1. Apology for the disruption.\n"
-            f"2. What has been arranged: {solution_text}\n"
-            f"3. Next steps: {next_steps}\n"
-            f"4. Confirm no further action is needed on their part.\n"
-            "Keep it to 4–5 sentences."
-        ))
+        sys_msg = SystemMessage(
+            content=FINAL_RESPONSE_RESOLVED_PROMPT.format(
+                passenger=passenger,
+                solution_text=solution_text,
+                next_steps=next_steps
+            )
+        )
 
     response = llm.invoke([sys_msg])
     content = response.content

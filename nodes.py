@@ -109,6 +109,36 @@ def request_classifier(state: RebookingState) -> dict:
     }
 
 
+# ── Node 1b: Clarify Constraints (Bonus) ─────────────────────────────────────
+
+# Phrases that signal the passenger gave no real constraints
+_VAGUE_CONSTRAINTS = {"none", "no constraints", "n/a", "na", "", "not mentioned", "no specific constraints"}
+
+def clarify_constraints(state: RebookingState) -> dict:
+    """
+    Bonus node — only reached for 'rebook' intent.
+    If the passenger's constraints are vague (e.g. 'none'), pause with interrupt()
+    and ask them for details before flight search begins.
+    The human's answer is injected back as the new constraints value.
+
+    Writes: constraints (updated if clarification was needed).
+    """
+    constraints = (state.get("constraints") or "none").strip().lower()
+
+    if constraints in _VAGUE_CONSTRAINTS:
+        # Pause the graph and ask the passenger
+        answer = interrupt(
+            "❓ Clarification needed: Could you tell us more about your travel requirements?\n"
+            "For example: preferred arrival date/time, cabin class, or any other preferences.\n"
+            "(Type your answer and press Enter)"
+        )
+        # `answer` is whatever the human typed when resuming the graph
+        return {"constraints": str(answer).strip()}
+
+    # Constraints are clear — continue without interrupting
+    return {}
+
+
 # ── Node 2: Rebooking Agent ───────────────────────────────────────────────────
 
 def rebooking_agent(state: RebookingState) -> dict:

@@ -1,14 +1,17 @@
 """
 main.py — Runs all 4 test scenarios plus the Scenario 1 follow-up.
 
+Handles two types of interrupt() pauses:
+  1. clarify_constraints  — asks the passenger for travel constraints
+  2. policy_checker       — asks a supervisor to approve refunds/compensation > $300
+
 Usage:
     python main.py
 
 Environment:
-    XAI_API_KEY must be set in .env (see .env.example).
+    GROQ_API_KEY must be set in .env (see .env.example).
 """
 import os
-import json
 import sys
 from dotenv import load_dotenv
 
@@ -16,6 +19,7 @@ load_dotenv()
 
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 
 from graph import build_graph
 
@@ -32,38 +36,87 @@ def print_scenario_header(scenario_id: str, message: str) -> None:
     print_separator("═")
 
 
-def run_graph(graph, initial_state: dict, config: dict) -> dict:
-    """Stream the graph and print the execution path. Returns the final state."""
+def _print_node_update(node_name: str, updates: dict) -> None:
+    """Print relevant state fields changed by a node."""
+    if not updates:
+        print(f"  [{node_name}]")
+        return
+
+    interesting = {}
+    for key in ("intent", "constraints", "proposed_solution", "policy_check_result",
+                "failure_reason", "retry_count", "escalation_status"):
+        if key in updates and updates[key] not in (None, "", False, 0):
+            # Only show retry_count when it's > 0
+            if key == "retry_count" and updates[key] == 0:
+                continue
+            interesting[key] = updates[key]
+
+    print(f"  [{node_name}]")
+    for k, v in interesting.items():
+        print(f"    {k}: {v}")
+
+
+def _check_and_handle_interrupt(graph, config: dict) -> tuple[bool, str]:
+    """
+    Check if the graph is paused on an interrupt().
+    If yes, print the interrupt message, get user input, and return (True, user_input).
+    Returns (False, "") if the graph is not interrupted.
+    """
+    current_state = graph.get_state(config)
+
+    # Check if there are pending interrupt tasks
+    interrupted = False
+    interrupt_value = ""
+    for task in current_state.tasks:
+        if hasattr(task, "interrupts") and task.interrupts:
+            interrupted = True
+            interrupt_value = task.interrupts[0].value
+            break
+
+    if interrupted:
+        print()
+        print_separator("*")
+        print(interrupt_value)
+        print_separator("*")
+        user_input = input("  Your answer: ").strip()
+        return True, user_input
+
+    return False, ""
+
+
+def run_graph(graph, initial_input, config: dict) -> dict:
+    """
+    Stream the graph, handle any interrupt() pauses interactively, and return final state.
+    `initial_input` is either a plain state dict (first call) or a Command(resume=...) (resume).
+    """
     path = []
-    for event in graph.stream(initial_state, config=config):
+
+    # Stream until the graph stops (END or interrupt)
+    for event in graph.stream(initial_input, config=config, stream_mode="updates"):
         for node_name, updates in event.items():
             path.append(node_name)
-            # Show key state changes per node
-            interesting = {}
-            if "intent" in updates:
-                interesting["intent"] = updates["intent"]
-            if "constraints" in updates:
-                interesting["constraints"] = updates["constraints"]
-            if "proposed_solution" in updates and updates["proposed_solution"]:
-                interesting["proposed_solution"] = updates["proposed_solution"]
-            if "policy_check_result" in updates:
-                interesting["policy_check_result"] = updates["policy_check_result"]
-            if "failure_reason" in updates and updates["failure_reason"]:
-                interesting["failure_reason"] = updates["failure_reason"]
-            if "retry_count" in updates:
-                interesting["retry_count"] = updates["retry_count"]
-            if "escalation_status" in updates and updates["escalation_status"]:
-                interesting["escalation_status"] = updates["escalation_status"]
-
-            if interesting:
-                print(f"  [{node_name}]")
-                for k, v in interesting.items():
-                    print(f"    {k}: {v}")
-            else:
-                print(f"  [{node_name}]")
+            _print_node_update(node_name, updates)
 
     print()
     print(f"  Execution path: {' → '.join(path)}")
+
+    # ── Interrupt handling loop ────────────────────────────────────────────────
+    # The graph may pause at interrupt() points. We loop until it truly ends.
+    while True:
+        is_interrupted, user_answer = _check_and_handle_interrupt(graph, config)
+        if not is_interrupted:
+            break
+
+        # Resume with the human's answer
+        resume_path = []
+        for event in graph.stream(Command(resume=user_answer), config=config, stream_mode="updates"):
+            for node_name, updates in event.items():
+                resume_path.append(node_name)
+                _print_node_update(node_name, updates)
+
+        if resume_path:
+            print()
+            print(f"  (Resumed) path: {' → '.join(resume_path)}")
 
     final = graph.get_state(config).values
     return final
@@ -78,7 +131,9 @@ SCENARIOS = [
         "request_id": "R-7702",
         "booking_ref": "XK9L2P",
         "message": "My flight to Dubai was cancelled. I need to be there by tomorrow noon.",
-        "expected_path": "Classifier → Rebooking ⇄ Tools → Policy checker (pass) → Final response",
+        "expected_path": (
+            "Classifier → Clarify constraints → Rebooking ⇄ Tools → Policy checker (pass) → Final response"
+        ),
     },
     {
         "id": "2",
@@ -86,15 +141,17 @@ SCENARIOS = [
         "request_id": "R-7703",
         "booking_ref": "B77XYZ",
         "message": "My flight is delayed 6 hours. Am I entitled to anything?",
-        "expected_path": "Classifier → Compensation → Policy checker (pass) → Final response",
+        "expected_path": "Classifier → Compensation → Policy checker (pass, $200) → Final response",
     },
     {
         "id": "3",
         "thread_id": "thread_sc3",
         "request_id": "R-7704",
         "booking_ref": "C88ABC",
-        "message": "My flight was cancelled. I need to be rebooked.",
-        "expected_path": "Classifier → Rebooking ⇄ Policy checker (fails 3×) → Escalation → Final response",
+        "message": "My flight was cancelled. Please rebook me.",
+        "expected_path": (
+            "Classifier → Clarify → Rebooking ⇄ Policy checker (fails 3×) → Escalation → Final response"
+        ),
     },
     {
         "id": "4",
@@ -107,7 +164,7 @@ SCENARIOS = [
 ]
 
 
-def run_all_scenarios(graph, checkpointer: MemorySaver) -> None:
+def run_all_scenarios(graph) -> None:
     for sc in SCENARIOS:
         print_scenario_header(sc["id"], sc["message"])
         print(f"  Expected path: {sc['expected_path']}")
@@ -126,25 +183,25 @@ def run_all_scenarios(graph, checkpointer: MemorySaver) -> None:
 
         print()
         print("  ── FINAL RESPONSE ──")
-        print(final.get("final_response", "(no response)"))
+        print(final.get("final_response", "(no response yet — graph may still be interrupted)"))
         print()
 
-    # ── Scenario 1 follow-up ───────────────────────────────────────────────
+    # ── Scenario 1 follow-up ───────────────────────────────────────────────────
     print_scenario_header("1 FOLLOW-UP", "Actually, can I get a refund instead?")
-    print("  (Continues thread_sc1 — no booking_ref needed; state is persisted)")
+    print("  (Continues thread_sc1 — booking_ref reused from checkpoint, no need to re-enter)")
     print_separator()
 
     config = {"configurable": {"thread_id": "thread_sc1"}}
     follow_up_state = {
         "messages": [HumanMessage(content="Actually, can I get a refund instead?")],
-        # NOTE: booking_ref, intent, booking_details already in checkpointed state
+        # booking_ref, booking_details, etc. are already in the checkpointed state
     }
 
     final = run_graph(graph, follow_up_state, config)
 
     print()
     print("  ── FINAL RESPONSE ──")
-    print(final.get("final_response", "(no response)"))
+    print(final.get("final_response", "(no response yet — awaiting human approval)"))
     print()
 
 
@@ -173,4 +230,4 @@ if __name__ == "__main__":
     save_graph_diagram(graph)
     print()
 
-    run_all_scenarios(graph, checkpointer)
+    run_all_scenarios(graph)

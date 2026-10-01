@@ -1,4 +1,4 @@
-# ✈️ Flight Disruption Rebooking Assistant
+# ✈️ Flight Disruption handling Assistant
 
 A LangGraph-powered multi-agent system that handles airline disruptions (cancellations and delays).
 Passengers send a message; the system classifies their intent, dispatches a specialist agent, validates the solution against policy, and replies — all in one deterministic, checkpointed graph.

@@ -220,7 +220,7 @@ Mock data returns only Business-class seats → policy fails 3 times.
 
 ## Bonus Features Implemented
 
-- **Human-in-the-loop** (`interrupt()`): The `policy_checker` pauses the graph and requests supervisor approval for any refund or compensation exceeding **$300** before the final response is sent and if the intent is re-booking and if constraint is not given then it stops and asks the user to give the constraint .
+- **Human-in-the-loop** (`interrupt()`): The `policy_checker` pauses the graph and requests supervisor approval for any refund or compensation exceeding **$300** before the final response is sent.
 
 ---
 
